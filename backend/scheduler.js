@@ -8,10 +8,14 @@ const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
  */
 async function fetchMetaAdsData() {
     const accessToken = process.env.META_USER_TOKEN;
-    const adAccountId = process.env.AD_ACCOUNT_ID;
+    let adAccountId = process.env.AD_ACCOUNT_ID;
 
     if (!accessToken || !adAccountId || adAccountId === 'your_ad_account_id') {
         throw new Error('Meta API credentials missing. Check META_USER_TOKEN and AD_ACCOUNT_ID in .env');
+    }
+
+    if (!adAccountId.startsWith('act_')) {
+        adAccountId = 'act_' + adAccountId;
     }
 
     const { default: fetch } = await import('node-fetch');
