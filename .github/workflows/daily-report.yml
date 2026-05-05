@@ -1,0 +1,37 @@
+name: Daily Meta Ads Report
+
+on:
+  schedule:
+    - cron: '0 9 * * *' # Runs every day at 09:00 UTC
+  workflow_dispatch: # Allows manual trigger
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          cd backend
+          npm install
+
+      - name: Run scheduler
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AGENT_ID: ${{ secrets.AGENT_ID }}
+          ENV_ID: ${{ secrets.ENV_ID }}
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          META_USER_TOKEN: ${{ secrets.META_USER_TOKEN }}
+          META_APP_TOKEN: ${{ secrets.META_APP_TOKEN }}
+          AD_ACCOUNT_ID: ${{ secrets.AD_ACCOUNT_ID }}
+        run: |
+          cd backend
+          node scheduler.js
