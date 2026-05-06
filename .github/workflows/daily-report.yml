@@ -30,8 +30,10 @@ jobs:
           ENV_ID: ${{ secrets.ENV_ID }}
           TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
           META_USER_TOKEN: ${{ secrets.META_USER_TOKEN }}
-          META_APP_TOKEN: ${{ secrets.META_APP_TOKEN }}
+          META_APP_ID: ${{ secrets.META_APP_ID }}
           AD_ACCOUNT_ID: ${{ secrets.AD_ACCOUNT_ID }}
+          SHOPIFY_STORE_URL: ${{ secrets.SHOPIFY_STORE_URL }}
+          SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
         run: |
           cd backend
           node scheduler.js

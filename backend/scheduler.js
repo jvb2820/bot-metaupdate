@@ -4,48 +4,175 @@ const Anthropic = require('@anthropic-ai/sdk');
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 /**
+ * Retry wrapper with exponential backoff.
+ * Retries up to `maxRetries` times, waiting longer each attempt.
+ */
+async function withRetry(fn, label, maxRetries = 3) {
+    const delays = [60, 120, 240]; // seconds
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            return await fn();
+        } catch (error) {
+            const isRateLimit =
+                error.message?.includes('request limit reached') ||
+                error.message?.includes('rate limit') ||
+                error.message?.includes('too many');
+
+            if (isRateLimit && attempt < maxRetries) {
+                const waitSec = delays[attempt - 1];
+                console.warn(`⏳ ${label}: Rate limited. Retrying in ${waitSec}s (attempt ${attempt}/${maxRetries})...`);
+                await new Promise(r => setTimeout(r, waitSec * 1000));
+            } else {
+                throw error;
+            }
+        }
+    }
+}
+
+/**
  * Fetches raw Meta Ads performance data from the Graph API.
  */
 async function fetchMetaAdsData() {
-    const accessToken = process.env.META_USER_TOKEN;
-    let adAccountId = process.env.AD_ACCOUNT_ID;
+    return withRetry(async () => {
+        const accessToken = process.env.META_USER_TOKEN;
+        let adAccountId = process.env.AD_ACCOUNT_ID;
 
-    if (!accessToken || !adAccountId || adAccountId === 'your_ad_account_id') {
-        throw new Error('Meta API credentials missing. Check META_USER_TOKEN and AD_ACCOUNT_ID in .env');
-    }
+        if (!accessToken || !adAccountId || adAccountId === 'your_ad_account_id') {
+            throw new Error('Meta API credentials missing. Check META_USER_TOKEN and AD_ACCOUNT_ID in .env');
+        }
 
-    if (!adAccountId.startsWith('act_')) {
-        adAccountId = 'act_' + adAccountId;
+        if (!adAccountId.startsWith('act_')) {
+            adAccountId = 'act_' + adAccountId;
+        }
+
+        const { default: fetch } = await import('node-fetch');
+
+        // Fields to fetch — includes funnel cost breakdowns and ROAS
+        const fields = [
+            'campaign_name',
+            'adset_name',
+            'ad_name',
+            'spend',
+            'impressions',
+            'clicks',
+            'actions',
+            'cost_per_action_type',
+            'action_values',
+            'purchase_roas',
+            'frequency',
+            'cpm',
+            'cpp',
+            'ctr'
+        ].join(',');
+
+        const url = `https://graph.facebook.com/v19.0/${adAccountId}/insights?level=ad&fields=${fields}&date_preset=last_7d&access_token=${accessToken}`;
+
+        console.log('Fetching Meta Ads data...');
+        const response = await fetch(url);
+        const result = await response.json();
+
+        if (result.error) {
+            throw new Error(`Meta API Error: ${result.error.message}`);
+        }
+
+        return JSON.stringify(result.data, null, 2);
+    }, 'Meta Ads API');
+}
+
+/**
+ * Fetches Shopify order and sales data from the Admin API (last 7 days).
+ */
+async function fetchShopifyData() {
+    const storeUrl = process.env.SHOPIFY_STORE_URL;
+    const accessToken = process.env.SHOPIFY_ACCESS_TOKEN;
+
+    if (!storeUrl || !accessToken) {
+        console.warn('⚠️ Skipping Shopify data: SHOPIFY_STORE_URL or SHOPIFY_ACCESS_TOKEN not configured.');
+        return null;
     }
 
     const { default: fetch } = await import('node-fetch');
-    
-    // Fields to fetch for analysis
-    const fields = [
-        'campaign_name',
-        'adset_name',
-        'ad_name',
-        'spend',
-        'impressions',
-        'clicks',
-        'actions', // for conversions/ROAS
-        'frequency',
-        'cpm',
-        'cpp',
-        'ctr'
-    ].join(',');
 
-    const url = `https://graph.facebook.com/v19.0/${adAccountId}/insights?level=ad&fields=${fields}&date_preset=last_7d&access_token=${accessToken}`;
+    // Calculate date 7 days ago
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    const sinceDate = sevenDaysAgo.toISOString();
 
-    console.log('Fetching Meta Ads data...');
-    const response = await fetch(url);
-    const result = await response.json();
+    const baseUrl = `https://${storeUrl}.myshopify.com/admin/api/2024-01`;
 
-    if (result.error) {
-        throw new Error(`Meta API Error: ${result.error.message}`);
+    console.log('Fetching Shopify data...');
+
+    try {
+        // Fetch orders from the last 7 days
+        const ordersUrl = `${baseUrl}/orders.json?status=any&created_at_min=${sinceDate}&limit=250`;
+        const ordersResponse = await fetch(ordersUrl, {
+            headers: {
+                'X-Shopify-Access-Token': accessToken,
+                'Content-Type': 'application/json'
+            }
+        });
+
+        if (!ordersResponse.ok) {
+            throw new Error(`Shopify API responded with ${ordersResponse.status}: ${await ordersResponse.text()}`);
+        }
+
+        const ordersData = await ordersResponse.json();
+        const orders = ordersData.orders || [];
+
+        // Compute summary metrics
+        const totalOrders = orders.length;
+        const totalRevenue = orders.reduce((sum, o) => sum + parseFloat(o.total_price || 0), 0);
+        const avgOrderValue = totalOrders > 0 ? (totalRevenue / totalOrders).toFixed(2) : 0;
+
+        // Traffic source breakdown from referring_site and source_name
+        const trafficSources = {};
+        orders.forEach(order => {
+            const source = order.source_name || 'unknown';
+            const referrer = order.referring_site || '';
+            let channel = 'Direct';
+
+            if (referrer.includes('google')) channel = 'Google';
+            else if (referrer.includes('facebook') || referrer.includes('fb') || referrer.includes('instagram') || referrer.includes('meta')) channel = 'Meta';
+            else if (referrer.includes('tiktok')) channel = 'TikTok';
+            else if (referrer.includes('klaviyo')) channel = 'Klaviyo';
+            else if (source === 'web' && !referrer) channel = 'Direct';
+            else if (referrer) channel = referrer;
+
+            trafficSources[channel] = (trafficSources[channel] || 0) + 1;
+        });
+
+        // Revenue by channel
+        const revenueBySources = {};
+        orders.forEach(order => {
+            const referrer = order.referring_site || '';
+            let channel = 'Direct';
+
+            if (referrer.includes('google')) channel = 'Google';
+            else if (referrer.includes('facebook') || referrer.includes('fb') || referrer.includes('instagram') || referrer.includes('meta')) channel = 'Meta';
+            else if (referrer.includes('tiktok')) channel = 'TikTok';
+            else if (referrer.includes('klaviyo')) channel = 'Klaviyo';
+            else if (referrer) channel = referrer;
+
+            revenueBySources[channel] = (revenueBySources[channel] || 0) + parseFloat(order.total_price || 0);
+        });
+
+        const shopifySummary = {
+            period: `Last 7 days (since ${sevenDaysAgo.toISOString().split('T')[0]})`,
+            total_orders: totalOrders,
+            total_revenue: totalRevenue.toFixed(2),
+            average_order_value: avgOrderValue,
+            orders_by_traffic_source: trafficSources,
+            revenue_by_traffic_source: revenueBySources,
+            currency: orders[0]?.currency || 'USD'
+        };
+
+        console.log('✅ Shopify data fetched successfully.');
+        return JSON.stringify(shopifySummary, null, 2);
+
+    } catch (error) {
+        console.error('❌ Shopify fetch error:', error.message);
+        return null;
     }
-
-    return JSON.stringify(result.data, null, 2);
 }
 
 /**
@@ -65,7 +192,7 @@ async function sendToTeams(message) {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                text: `**Daily Meta Ads Performance Report**\n\n${message}`
+                text: `**Daily Meta Ads & Shopify Performance Report**\n\n${message}`
             })
         });
 
@@ -84,11 +211,24 @@ async function runWorkflow() {
     console.log(`[${new Date().toLocaleString()}] Starting automation workflow...`);
 
     try {
-        // 1. Fetch Raw Data
-        const rawData = await fetchMetaAdsData();
+        // 1. Fetch Raw Data from both sources
+        const rawMetaData = await fetchMetaAdsData();
         console.log('✅ Meta Ads data fetched successfully.');
 
-        // 2. Analyze with Claude
+        const rawShopifyData = await fetchShopifyData();
+
+        // 2. Build the prompt with all available data
+        let dataPrompt = `Analyze the following data for the last 7 days and generate the full performance report as defined in your system prompt.\n\n`;
+        dataPrompt += `## META ADS RAW DATA\n${rawMetaData}\n\n`;
+
+        if (rawShopifyData) {
+            dataPrompt += `## SHOPIFY DATA\n${rawShopifyData}\n\n`;
+            dataPrompt += `## INSTRUCTIONS\nUse both Meta and Shopify data to complete ALL sections of the report: Top 5 Ads, Ad Pruning, Shopify Metrics, Cross-Platform Validation, Profitability, and Action Items.`;
+        } else {
+            dataPrompt += `## INSTRUCTIONS\nShopify data was unavailable. Complete the Meta Ads sections (Top 5 Ads, Ad Pruning) and note that Shopify sections could not be generated.`;
+        }
+
+        // 3. Analyze with Claude Agent
         const session = await client.beta.sessions.create({
             agent: process.env.AGENT_ID,
             environment_id: process.env.ENV_ID,
@@ -99,7 +239,7 @@ async function runWorkflow() {
                 type: 'user.message',
                 content: [{
                     type: 'text',
-                    text: `Analyze the following Meta Ads raw data for the last 7 days and generate the performance report. Use the targets (ROAS/CPA) defined in your system prompt or use industry defaults if none provided.\n\nRAW DATA:\n${rawData}`
+                    text: dataPrompt
                 }]
             }]
         }, { headers: { 'anthropic-beta': 'managed-agents-2026-04-01' } });
@@ -118,10 +258,10 @@ async function runWorkflow() {
             if (event.type === 'session.status_idle') break;
         }
 
-        // 3. Post to Teams
+        // 4. Post to Teams
         if (reply) {
             await sendToTeams(reply);
-            console.log('✅ Update posted to Teams!');
+            console.log('✅ Report posted to Teams!');
         } else {
             console.warn('⚠️ Agent returned an empty response.');
         }
