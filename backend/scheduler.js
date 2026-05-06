@@ -80,16 +80,57 @@ async function fetchMetaAdsData() {
 }
 
 /**
+ * Generates a fresh Shopify access token using OAuth client_credentials grant.
+ * Token expires every ~24 hours, so we generate a new one each run.
+ */
+async function getShopifyAccessToken() {
+    const storeUrl = process.env.SHOPIFY_STORE_URL;
+    const clientId = process.env.SHOPIFY_CLIENT_ID;
+    const clientSecret = process.env.SHOPIFY_CLIENT_SECRET;
+
+    if (!storeUrl || !clientId || !clientSecret) {
+        return null;
+    }
+
+    const { default: fetch } = await import('node-fetch');
+
+    const tokenUrl = `https://${storeUrl}.myshopify.com/admin/oauth/access_token`;
+
+    const response = await fetch(tokenUrl, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Accept': 'application/json'
+        },
+        body: new URLSearchParams({
+            grant_type: 'client_credentials',
+            client_id: clientId,
+            client_secret: clientSecret
+        })
+    });
+
+    if (!response.ok) {
+        throw new Error(`Shopify OAuth failed with ${response.status}: ${await response.text()}`);
+    }
+
+    const data = await response.json();
+    console.log(`✅ Shopify access token generated (expires in ${data.expires_in}s)`);
+    return data.access_token;
+}
+
+/**
  * Fetches Shopify order and sales data from the Admin API (last 7 days).
  */
 async function fetchShopifyData() {
     const storeUrl = process.env.SHOPIFY_STORE_URL;
-    const accessToken = process.env.SHOPIFY_ACCESS_TOKEN;
 
-    if (!storeUrl || !accessToken) {
-        console.warn('⚠️ Skipping Shopify data: SHOPIFY_STORE_URL or SHOPIFY_ACCESS_TOKEN not configured.');
+    if (!storeUrl || !process.env.SHOPIFY_CLIENT_ID || !process.env.SHOPIFY_CLIENT_SECRET) {
+        console.warn('⚠️ Skipping Shopify data: SHOPIFY_STORE_URL, SHOPIFY_CLIENT_ID, or SHOPIFY_CLIENT_SECRET not configured.');
         return null;
     }
+
+    // Generate a fresh access token
+    const accessToken = await getShopifyAccessToken();
 
     const { default: fetch } = await import('node-fetch');
 

@@ -33,7 +33,8 @@ jobs:
           META_APP_ID: ${{ secrets.META_APP_ID }}
           AD_ACCOUNT_ID: ${{ secrets.AD_ACCOUNT_ID }}
           SHOPIFY_STORE_URL: ${{ secrets.SHOPIFY_STORE_URL }}
-          SHOPIFY_ACCESS_TOKEN: ${{ secrets.SHOPIFY_ACCESS_TOKEN }}
+          SHOPIFY_CLIENT_ID: ${{ secrets.SHOPIFY_CLIENT_ID }}
+          SHOPIFY_CLIENT_SECRET: ${{ secrets.SHOPIFY_CLIENT_SECRET }}
         run: |
           cd backend
           node scheduler.js
