@@ -2,7 +2,7 @@ name: Daily Meta Ads Report
 
 on:
   schedule:
-    - cron: '0 12 * * *' # Runs every day at 12:00 UTC = 8:00 PM PHT
+    - cron: '37 11 * * *' # Runs every day at 11:37 UTC ≈ 7:37 PM PHT (offset to avoid GH Actions peak congestion)
   workflow_dispatch: # Allows manual trigger
 
 jobs:
