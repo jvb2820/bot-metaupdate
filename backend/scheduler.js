@@ -224,7 +224,7 @@ async function sendToTeams(message) {
     
     if (!webhookUrl || webhookUrl === 'your_teams_webhook_url') {
         console.warn('⚠️ Skipping Teams notification: TEAMS_WEBHOOK_URL is not configured.');
-        return;
+        return false;
     }
 
     try {
@@ -240,8 +240,145 @@ async function sendToTeams(message) {
         if (!response.ok) {
             throw new Error(`Teams API responded with ${response.status}: ${await response.text()}`);
         }
+
+        return true;
     } catch (error) {
         console.error('❌ Failed to send message to Teams:', error.message);
+        return false;
+    }
+}
+
+function parseJsonOrNull(value) {
+    if (!value) {
+        return null;
+    }
+
+    try {
+        return JSON.parse(value);
+    } catch (error) {
+        console.warn('Could not parse JSON payload for storage:', error.message);
+        return null;
+    }
+}
+
+function getReportPeriod() {
+    const periodEnd = new Date();
+    const periodStart = new Date(periodEnd);
+    periodStart.setDate(periodStart.getDate() - 7);
+
+    return {
+        periodStart: periodStart.toISOString().split('T')[0],
+        periodEnd: periodEnd.toISOString().split('T')[0],
+        periodLabel: `Last 7 days (${periodStart.toISOString().split('T')[0]} to ${periodEnd.toISOString().split('T')[0]})`
+    };
+}
+
+function chunkReport(reportText) {
+    const sections = reportText
+        .split(/\n(?=#{1,4}\s+)/g)
+        .map(section => section.trim())
+        .filter(Boolean);
+
+    const sourceSections = sections.length > 1 ? sections : [reportText.trim()];
+    const chunks = [];
+
+    for (const section of sourceSections) {
+        const headingMatch = section.match(/^#{1,4}\s+(.+)$/m);
+        const heading = headingMatch ? headingMatch[1].trim() : 'Report';
+
+        for (let start = 0; start < section.length; start += 3000) {
+            const content = section.slice(start, start + 3000).trim();
+            if (!content) {
+                continue;
+            }
+
+            chunks.push({
+                chunk_index: chunks.length,
+                heading,
+                content,
+                token_estimate: Math.ceil(content.length / 4)
+            });
+        }
+    }
+
+    return chunks;
+}
+
+async function supabaseRequest(table, options = {}) {
+    const restUrl = process.env.SUPABASE_REST_URL || (process.env.SUPABASE_URL ? `${process.env.SUPABASE_URL}/rest/v1` : '');
+    const apiKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+
+    if (!restUrl || !apiKey) {
+        throw new Error('Supabase configuration missing. Set SUPABASE_REST_URL and SUPABASE_ANON_KEY.');
+    }
+
+    const { default: fetch } = await import('node-fetch');
+    const response = await fetch(`${restUrl.replace(/\/$/, '')}/${table}${options.query || ''}`, {
+        method: options.method || 'POST',
+        headers: {
+            apikey: apiKey,
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+            Prefer: 'return=representation'
+        },
+        body: options.body ? JSON.stringify(options.body) : undefined
+    });
+
+    const responseText = await response.text();
+    const data = responseText ? JSON.parse(responseText) : null;
+
+    if (!response.ok) {
+        throw new Error(`Supabase ${table} request failed with ${response.status}: ${responseText}`);
+    }
+
+    return data;
+}
+
+async function storeReportInSupabase({ reportText, rawMetaData, rawShopifyData, dataPrompt, sessionId }) {
+    try {
+        const { periodStart, periodEnd, periodLabel } = getReportPeriod();
+        const metaRaw = parseJsonOrNull(rawMetaData);
+        const shopifySummary = parseJsonOrNull(rawShopifyData);
+
+        const reportRows = await supabaseRequest('agent_reports', {
+            body: {
+                generated_at: new Date().toISOString(),
+                period_start: periodStart,
+                period_end: periodEnd,
+                period_label: periodLabel,
+                report_text: reportText,
+                prompt_text: dataPrompt,
+                meta_raw: metaRaw,
+                shopify_summary: shopifySummary,
+                has_shopify_data: Boolean(shopifySummary),
+                agent_session_id: sessionId
+            }
+        });
+
+        const reportId = reportRows?.[0]?.id;
+        if (!reportId) {
+            throw new Error('Supabase did not return the inserted report id.');
+        }
+
+        const chunks = chunkReport(reportText).map(chunk => ({
+            report_id: reportId,
+            ...chunk,
+            metadata: {
+                period_start: periodStart,
+                period_end: periodEnd,
+                period_label: periodLabel
+            }
+        }));
+
+        if (chunks.length > 0) {
+            await supabaseRequest('agent_report_chunks', { body: chunks });
+        }
+
+        console.log(`Report stored in Supabase (${reportId}, ${chunks.length} chunks).`);
+        return reportId;
+    } catch (error) {
+        console.error('Failed to store report in Supabase:', error.message);
+        return null;
     }
 }
 
@@ -319,10 +456,20 @@ async function runWorkflow() {
             }
         }
 
-        // 4. Post to Teams
+        // 4. Store the report for RAG, then post to Teams
         if (reply) {
-            await sendToTeams(reply);
-            console.log('✅ Report posted to Teams!');
+            await storeReportInSupabase({
+                reportText: reply,
+                rawMetaData,
+                rawShopifyData,
+                dataPrompt,
+                sessionId: session.id
+            });
+
+            const teamsPosted = await sendToTeams(reply);
+            if (teamsPosted) {
+                console.log('✅ Report posted to Teams!');
+            }
         } else {
             console.warn('⚠️ Agent returned an empty response.');
         }
