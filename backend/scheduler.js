@@ -254,9 +254,12 @@ async function runWorkflow() {
     try {
         // 1. Fetch Raw Data from both sources
         const rawMetaData = await fetchMetaAdsData();
-        console.log('✅ Meta Ads data fetched successfully.');
+        console.log(`✅ Meta Ads data fetched successfully (${(Buffer.byteLength(rawMetaData) / 1024).toFixed(2)} KB).`);
 
         const rawShopifyData = await fetchShopifyData();
+        if (rawShopifyData) {
+            console.log(`✅ Shopify data fetched successfully (${(Buffer.byteLength(rawShopifyData) / 1024).toFixed(2)} KB).`);
+        }
 
         // 2. Build the prompt with all available data
         let dataPrompt = `Analyze the following data for the last 7 days and generate the full performance report as defined in your system prompt.\n\n`;
@@ -275,6 +278,8 @@ async function runWorkflow() {
             environment_id: process.env.ENV_ID,
         }, { headers: { 'anthropic-beta': 'managed-agents-2026-04-01' } });
 
+        console.log(`🚀 Starting Anthropic session (${session.id})...`);
+
         await client.beta.sessions.events.send(session.id, {
             events: [{
                 type: 'user.message',
@@ -285,18 +290,33 @@ async function runWorkflow() {
             }]
         }, { headers: { 'anthropic-beta': 'managed-agents-2026-04-01' } });
 
+        console.log('📡 Streaming events from agent...');
         let reply = '';
         const stream = await client.beta.sessions.events.stream(session.id,
             { headers: { 'anthropic-beta': 'managed-agents-2026-04-01' } }
         );
 
         for await (const event of stream) {
+            console.log(`🔹 Event received: ${event.type}`);
+            
             if (event.type === 'agent.message') {
                 for (const block of event.content) {
-                    if (block.type === 'text') reply += block.text;
+                    if (block.type === 'text') {
+                        reply += block.text;
+                        // Log a small chunk to show progress
+                        process.stdout.write('.');
+                    }
                 }
             }
-            if (event.type === 'session.status_idle') break;
+            
+            if (event.type === 'error' || event.type === 'exception') {
+                console.error(`\n❌ Agent Stream Error:`, JSON.stringify(event, null, 2));
+            }
+
+            if (event.type === 'session.status_idle') {
+                console.log('\n✅ Session reached idle state.');
+                break;
+            }
         }
 
         // 4. Post to Teams
