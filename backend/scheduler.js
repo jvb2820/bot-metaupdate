@@ -1,7 +1,20 @@
 require('dotenv').config();
 const Anthropic = require('@anthropic-ai/sdk');
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const MANAGED_AGENTS_BETA = 'managed-agents-2026-04-01';
+const ANTHROPIC_API_KEY = requireEnv('ANTHROPIC_API_KEY');
+const AGENT_ID = requireEnv('AGENT_ID');
+const ENV_ID = requireEnv('ENV_ID');
+
+function requireEnv(name) {
+    const value = process.env[name]?.trim();
+    if (!value) {
+        throw new Error(`Missing required environment variable: ${name}`);
+    }
+    return value;
+}
+
+const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
 
 /**
  * Retry wrapper with exponential backoff.
@@ -304,6 +317,38 @@ function chunkReport(reportText) {
     return chunks;
 }
 
+function isCompleteReport(reportText) {
+    if (!reportText) {
+        return false;
+    }
+
+    const requiredSections = [
+        'Executive Summary',
+        'Top 5 Ads',
+        'Ad Pruning',
+        'Shopify Metrics',
+        'Cross-Platform Validation',
+        'Profitability',
+        'Action Items'
+    ];
+
+    return requiredSections.every(section => reportText.toLowerCase().includes(section.toLowerCase()));
+}
+
+function isRetriableAgentError(error) {
+    const status = error?.status;
+    if ([400, 401, 403, 404].includes(status)) {
+        return false;
+    }
+
+    const message = error?.message || '';
+    if (message.includes('requires user/tool action') || message.includes('incomplete report')) {
+        return false;
+    }
+
+    return true;
+}
+
 async function supabaseRequest(table, options = {}) {
     const restUrl = process.env.SUPABASE_REST_URL || (process.env.SUPABASE_URL ? `${process.env.SUPABASE_URL}/rest/v1` : '');
     const apiKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
@@ -399,7 +444,13 @@ async function runWorkflow() {
         }
 
         // 2. Build the prompt with all available data
-        let dataPrompt = `Analyze the following data for the last 7 days and generate the full performance report as defined in your system prompt.\n\n`;
+        let dataPrompt = [
+            'Analyze the following data for the last 7 days and generate the full performance report as defined in your system prompt.',
+            'This is an unattended scheduled workflow. Do not ask follow-up questions and do not narrate your process.',
+            'Use these benchmarks unless the data explicitly provides different ones: target ROAS >= 2.0, target CTR >= 1%, target CPA should be evaluated against 50% COGS/product-margin assumptions.',
+            'Return only the final report with these sections: Executive Summary, Top 5 Ads Table, Ad Pruning List, Shopify Metrics, Cross-Platform Validation, Profitability Calculation, Action Items.',
+            ''
+        ].join('\n');
         dataPrompt += `## META ADS RAW DATA\n${rawMetaData}\n\n`;
 
         if (rawShopifyData) {
@@ -413,14 +464,16 @@ async function runWorkflow() {
         const MAX_AGENT_RETRIES = 2;
         const AGENT_TIMEOUT_MS = 5 * 60 * 1000; // 5-minute timeout per attempt
         let reply = '';
+        let sessionId = null;
 
         for (let agentAttempt = 1; agentAttempt <= MAX_AGENT_RETRIES; agentAttempt++) {
             try {
                 reply = '';
                 const session = await client.beta.sessions.create({
-                    agent: process.env.AGENT_ID,
-                    environment_id: process.env.ENV_ID,
-                }, { headers: { 'anthropic-beta': 'managed-agents-2026-04-01' } });
+                    agent: AGENT_ID,
+                    environment_id: ENV_ID,
+                }, { headers: { 'anthropic-beta': MANAGED_AGENTS_BETA } });
+                sessionId = session.id;
 
                 console.log(`🚀 Starting Anthropic session (${session.id}) — attempt ${agentAttempt}/${MAX_AGENT_RETRIES}...`);
 
@@ -432,12 +485,12 @@ async function runWorkflow() {
                             text: dataPrompt
                         }]
                     }]
-                }, { headers: { 'anthropic-beta': 'managed-agents-2026-04-01' } });
+                }, { headers: { 'anthropic-beta': MANAGED_AGENTS_BETA } });
 
                 console.log('📡 Streaming events from agent...');
 
                 const stream = await client.beta.sessions.events.stream(session.id,
-                    { headers: { 'anthropic-beta': 'managed-agents-2026-04-01' } }
+                    { headers: { 'anthropic-beta': MANAGED_AGENTS_BETA } }
                 );
 
                 // Race the stream against a timeout
@@ -466,24 +519,33 @@ async function runWorkflow() {
                     }
 
                     if (event.type === 'session.status_idle') {
-                        console.log('\n✅ Session reached idle state.');
+                        const stopReason = event.stop_reason?.type || 'unknown';
+                        console.log(`\n✅ Session reached idle state (${stopReason}).`);
+                        if (stopReason === 'requires_action') {
+                            const eventIds = event.stop_reason.event_ids?.join(', ') || 'unknown';
+                            throw new Error(`Agent requires user/tool action before it can finish. Pending event ids: ${eventIds}`);
+                        }
+                        if (stopReason === 'retries_exhausted') {
+                            throw new Error('Agent retries exhausted before producing a complete report.');
+                        }
                         break;
                     }
                 }
 
                 clearTimeout(timeout);
 
-                // If we got a reply, break out of the retry loop
-                if (reply) break;
+                // If we got a complete report, break out of the retry loop
+                if (isCompleteReport(reply)) break;
 
                 // If timed out or empty reply, treat as retriable
                 if (timedOut) throw new Error('Agent session timed out');
                 if (!reply) throw new Error('Agent returned empty response');
+                throw new Error('Agent returned an incomplete report and it will not be posted.');
 
             } catch (agentError) {
                 console.error(`\n❌ Agent attempt ${agentAttempt} failed:`, agentError.message);
                 console.error('   Full error:', JSON.stringify(agentError, Object.getOwnPropertyNames(agentError), 2));
-                if (agentAttempt < MAX_AGENT_RETRIES) {
+                if (agentAttempt < MAX_AGENT_RETRIES && isRetriableAgentError(agentError)) {
                     console.log(`⏳ Retrying in 30s...`);
                     await new Promise(r => setTimeout(r, 30000));
                 } else {
@@ -499,7 +561,7 @@ async function runWorkflow() {
                 rawMetaData,
                 rawShopifyData,
                 dataPrompt,
-                sessionId: session.id
+                sessionId
             });
 
             const teamsPosted = await sendToTeams(reply);
