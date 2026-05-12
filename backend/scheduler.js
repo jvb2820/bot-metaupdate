@@ -409,50 +409,86 @@ async function runWorkflow() {
             dataPrompt += `## INSTRUCTIONS\nShopify data was unavailable. Complete the Meta Ads sections (Top 5 Ads, Ad Pruning) and note that Shopify sections could not be generated.`;
         }
 
-        // 3. Analyze with Claude Agent
-        const session = await client.beta.sessions.create({
-            agent: process.env.AGENT_ID,
-            environment_id: process.env.ENV_ID,
-        }, { headers: { 'anthropic-beta': 'managed-agents-2026-04-01' } });
-
-        console.log(`🚀 Starting Anthropic session (${session.id})...`);
-
-        await client.beta.sessions.events.send(session.id, {
-            events: [{
-                type: 'user.message',
-                content: [{
-                    type: 'text',
-                    text: dataPrompt
-                }]
-            }]
-        }, { headers: { 'anthropic-beta': 'managed-agents-2026-04-01' } });
-
-        console.log('📡 Streaming events from agent...');
+        // 3. Analyze with Claude Agent (with retry for transient failures)
+        const MAX_AGENT_RETRIES = 2;
+        const AGENT_TIMEOUT_MS = 5 * 60 * 1000; // 5-minute timeout per attempt
         let reply = '';
-        const stream = await client.beta.sessions.events.stream(session.id,
-            { headers: { 'anthropic-beta': 'managed-agents-2026-04-01' } }
-        );
 
-        for await (const event of stream) {
-            console.log(`🔹 Event received: ${event.type}`);
-            
-            if (event.type === 'agent.message') {
-                for (const block of event.content) {
-                    if (block.type === 'text') {
-                        reply += block.text;
-                        // Log a small chunk to show progress
-                        process.stdout.write('.');
+        for (let agentAttempt = 1; agentAttempt <= MAX_AGENT_RETRIES; agentAttempt++) {
+            try {
+                reply = '';
+                const session = await client.beta.sessions.create({
+                    agent: process.env.AGENT_ID,
+                    environment_id: process.env.ENV_ID,
+                }, { headers: { 'anthropic-beta': 'managed-agents-2026-04-01' } });
+
+                console.log(`🚀 Starting Anthropic session (${session.id}) — attempt ${agentAttempt}/${MAX_AGENT_RETRIES}...`);
+
+                await client.beta.sessions.events.send(session.id, {
+                    events: [{
+                        type: 'user.message',
+                        content: [{
+                            type: 'text',
+                            text: dataPrompt
+                        }]
+                    }]
+                }, { headers: { 'anthropic-beta': 'managed-agents-2026-04-01' } });
+
+                console.log('📡 Streaming events from agent...');
+
+                const stream = await client.beta.sessions.events.stream(session.id,
+                    { headers: { 'anthropic-beta': 'managed-agents-2026-04-01' } }
+                );
+
+                // Race the stream against a timeout
+                let timedOut = false;
+                const timeout = setTimeout(() => { timedOut = true; }, AGENT_TIMEOUT_MS);
+
+                for await (const event of stream) {
+                    if (timedOut) {
+                        console.error('\n⏰ Agent session timed out after 5 minutes.');
+                        break;
+                    }
+
+                    console.log(`🔹 Event received: ${event.type}`);
+
+                    if (event.type === 'agent.message') {
+                        for (const block of event.content) {
+                            if (block.type === 'text') {
+                                reply += block.text;
+                                process.stdout.write('.');
+                            }
+                        }
+                    }
+
+                    if (event.type === 'error' || event.type === 'exception') {
+                        console.error(`\n❌ Agent Stream Error:`, JSON.stringify(event, null, 2));
+                    }
+
+                    if (event.type === 'session.status_idle') {
+                        console.log('\n✅ Session reached idle state.');
+                        break;
                     }
                 }
-            }
-            
-            if (event.type === 'error' || event.type === 'exception') {
-                console.error(`\n❌ Agent Stream Error:`, JSON.stringify(event, null, 2));
-            }
 
-            if (event.type === 'session.status_idle') {
-                console.log('\n✅ Session reached idle state.');
-                break;
+                clearTimeout(timeout);
+
+                // If we got a reply, break out of the retry loop
+                if (reply) break;
+
+                // If timed out or empty reply, treat as retriable
+                if (timedOut) throw new Error('Agent session timed out');
+                if (!reply) throw new Error('Agent returned empty response');
+
+            } catch (agentError) {
+                console.error(`\n❌ Agent attempt ${agentAttempt} failed:`, agentError.message);
+                console.error('   Full error:', JSON.stringify(agentError, Object.getOwnPropertyNames(agentError), 2));
+                if (agentAttempt < MAX_AGENT_RETRIES) {
+                    console.log(`⏳ Retrying in 30s...`);
+                    await new Promise(r => setTimeout(r, 30000));
+                } else {
+                    throw agentError; // Final attempt — let the outer catch handle it
+                }
             }
         }
 
