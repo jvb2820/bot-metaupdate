@@ -4,7 +4,7 @@ const http = require('http');
 const Anthropic = require('@anthropic-ai/sdk');
 
 const PORT = Number(process.env.PORT || process.env.SERVER_PORT || 3001);
-const CHAT_MODEL = process.env.ANTHROPIC_CHAT_MODEL || 'claude-sonnet-4-6';
+const CHAT_MODEL = process.env.ANTHROPIC_CHAT_MODEL || 'claude-haiku-4-5';
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 function sendJson(response, statusCode, payload) {
