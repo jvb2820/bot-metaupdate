@@ -234,7 +234,7 @@ async function fetchShopifyData() {
  */
 async function sendToTeams(message) {
     const webhookUrl = process.env.TEAMS_WEBHOOK_URL;
-    
+
     if (!webhookUrl || webhookUrl === 'your_teams_webhook_url') {
         console.warn('⚠️ Skipping Teams notification: TEAMS_WEBHOOK_URL is not configured.');
         return false;
